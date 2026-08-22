@@ -1,0 +1,13 @@
+# Core (versions known to work with the thesis_aa package)
+torch>=2.0
+transformers>=4.30
+datasets>=2.10
+scikit-learn>=1.1
+spacy>=3.5
+pandas>=2.0
+numpy>=1.24
+tqdm>=4.65
+py7zr>=0.20  # for extracting the benchmark .csv.7z archives
+
+# Testing
+pytest>=7.0

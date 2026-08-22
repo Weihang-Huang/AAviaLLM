@@ -1,0 +1,1 @@
+"""Tests for thesis_aa (synthetic-data smoke tests, CPU-only)."""
