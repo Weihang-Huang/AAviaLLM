@@ -173,8 +173,11 @@ def train_authorial_model(
     os.makedirs(out_dir, exist_ok=True)
     save_path = os.path.join(out_dir, author_tag)
 
-    # Already trained? skip.
-    if os.path.isdir(os.path.join(save_path, "config.json")):
+    # Already trained? Skip. (The marker is the model's config.json —
+    # written last-ish by save_model, so its presence means the save
+    # completed. NOTE: use isfile, not isdir — this path points *at* the
+    # file, not its containing directory.)
+    if os.path.isfile(os.path.join(save_path, "config.json")):
         print(f"[ALMs] {author_tag}: already trained, skipping.")
         return save_path
 

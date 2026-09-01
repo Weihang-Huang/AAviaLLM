@@ -118,7 +118,7 @@ from sklearn.tree import DecisionTreeClassifier
 from tqdm import tqdm
 
 from .. import config, eval as eval_mod
-from .estimator import lerf_estimate, mle_estimate
+from .estimator import count_token_ids, lerf_estimate
 
 VOCAB_SIZE = config.GPT2_VOCAB_SIZE
 
@@ -198,16 +198,11 @@ def select_mfw(
     if k >= vocab_size:
         return X_train, X_test, np.arange(vocab_size)
 
-    # Observed training frequency.
-    counts = np.zeros(vocab_size, dtype=np.float64)
-    for text in train_texts:
-        clean = str(text).replace("<BOS>", "").replace("<EOS>", "")
-        if not clean.strip():
-            continue
-        ids = tokenizer(clean, return_tensors="pt").input_ids[0].tolist()
-        for tid in ids:
-            if 0 <= tid < vocab_size:
-                counts[tid] += 1
+    # Observed training frequency (shared counting helper from the
+    # estimator module — previously a duplicated tokenize-and-tally loop).
+    counts = count_token_ids(
+        train_texts, tokenizer=tokenizer, vocab_size=vocab_size,
+    )
     top_k = np.argsort(counts)[::-1][:k]
     return X_train[:, top_k], X_test[:, top_k], top_k
 
@@ -227,21 +222,33 @@ def build_classifiers() -> Dict[str, object]:
       - Gaussian NB      : default
       - Decision Tree    : max_depth=50, max_features="sqrt"
       - AdaBoost         : 30 stumps (depth-1), max_features="sqrt" via base estimator
-      - Hist GB          : 30 iters, max_depth=3, max_features=0.1
+      - Hist GB          : 30 iters, max_depth=3
+
+    **Reproducibility note.** Six of the eight are stochastic (SGD shuffling,
+    random feature subsets, bootstrap sampling). Without a seed, repeated
+    runs on identical data produce different accuracy tables — which makes
+    debugging and regression-testing impossible. We pin ``random_state=0``
+    everywhere it is accepted; the configurations are otherwise verbatim.
     """
     clf = {
-        "Linear SVM": SGDClassifier(loss="hinge", max_iter=1000, tol=1e-3, n_jobs=-1),
-        "Logistic Regression": SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3, n_jobs=-1),
-        "Random Forest": RandomForestClassifier(n_estimators=100, max_features="sqrt", n_jobs=-1),
-        "Extra Trees": ExtraTreesClassifier(n_estimators=100, max_depth=50, max_features="sqrt", n_jobs=-1),
-        "Gaussian Naive Bayes": GaussianNB(),
-        "Decision Tree": DecisionTreeClassifier(max_depth=50, max_features="sqrt"),
+        "Linear SVM": SGDClassifier(loss="hinge", max_iter=1000, tol=1e-3,
+                                    random_state=0, n_jobs=-1),
+        "Logistic Regression": SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3,
+                                             random_state=0, n_jobs=-1),
+        "Random Forest": RandomForestClassifier(n_estimators=100, max_features="sqrt",
+                                                random_state=0, n_jobs=-1),
+        "Extra Trees": ExtraTreesClassifier(n_estimators=100, max_depth=50,
+                                           max_features="sqrt", random_state=0, n_jobs=-1),
+        "Gaussian Naive Bayes": GaussianNB(),  # deterministic (closed-form)
+        "Decision Tree": DecisionTreeClassifier(max_depth=50, max_features="sqrt",
+                                                 random_state=0),
         "AdaBoost": AdaBoostClassifier(
             n_estimators=30,
-            estimator=DecisionTreeClassifier(max_depth=1),
+            estimator=DecisionTreeClassifier(max_depth=1, random_state=0),
+            random_state=0,
         ),
         "Histogram Gradient Boosting": HistGradientBoostingClassifier(
-            max_iter=30, max_depth=3,
+            max_iter=30, max_depth=3, random_state=0,
         ),
     }
     return clf
@@ -278,11 +285,13 @@ def run_lerf_aa(
         clf_clone.fit(X_train, y_train)
 
         pred = clf_clone.predict(X_test)
-        # Build rankings per test instance.
+        # Build rankings per test instance (batched: one call for ALL test
+        # documents instead of one sklearn call per document — predict_proba
+        # on tree ensembles is the expensive part on 50k-dim inputs).
+        scores_mat = _batched_scores(clf_clone, X_test, classes)
         rank_list = []
         for i in range(len(X_test)):
-            scores = _per_instance_scores(clf_clone, X_test[i:i + 1], classes)
-            ordered = [c for c, _ in sorted(zip(classes, scores), key=lambda x: -x[1])]
+            ordered = [c for c, _ in sorted(zip(classes, scores_mat[i]), key=lambda x: -x[1])]
             rank_list.append(ordered)
 
         row = {
@@ -298,8 +307,8 @@ def run_lerf_aa(
     return pd.DataFrame(rows)
 
 
-def _per_instance_scores(clf, x: np.ndarray, classes) -> np.ndarray:
-    """Return a per-class score vector for one test instance.
+def _batched_scores(clf, X: np.ndarray, classes) -> np.ndarray:
+    """Return an ``(n_test_docs, n_classes)`` per-class score matrix.
 
     Ranking candidates requires a per-class score. Different classifier
     families expose this differently:
@@ -313,28 +322,40 @@ def _per_instance_scores(clf, x: np.ndarray, classes) -> np.ndarray:
         ``predict_proba`` — a probability per class.
 
       * **Fallback**: if neither is available, we one-hot encode the
-        single ``predict`` result (rank degenerates to putting the
-        predicted class first, all others tied).
+        ``predict`` results (rank degenerates to putting the predicted
+        class first, all others tied).
 
     **Binary edge case:** For a 2-class problem ``decision_function`` returns
     a 1-D array (the score for the *positive* class only). We expand it to
-    ``[s, -s]`` so the two classes get symmetric scores and the ranking
-    still works. This case doesn't arise in the thesis (>=7 candidate
-    authors) but we handle it for correctness on tiny synthetic tests.
+    ``[s, -s]`` per instance so the two classes get symmetric scores and the
+    ranking still works. This case doesn't arise in the thesis (>=7
+    candidate authors) but we handle it for correctness on tiny tests.
+
+    **Batching note:** this replaces the former one-instance-at-a-time
+    helper (``_per_instance_scores``); computing scores for all test
+    documents in one call avoids per-call overhead and lets tree ensembles
+    share work across rows. The score *values* are identical.
     """
+    # Margin scores first (SVM/LogReg families).
     try:
-        s = clf.decision_function(x)
-        if s.ndim == 1:  # binary
-            return np.array([s[0], -s[0]])
-        return s.ravel()
+        S = clf.decision_function(X)
+        S = np.asarray(S)
+        if S.ndim == 1:  # binary: (n,) -> (n, 2) with symmetric scores
+            S = np.column_stack([S, -S])
+        if S.shape[0] == len(X):
+            return S
     except Exception:
         pass
+    # Probabilities (NB / tree ensembles / boosting families).
     try:
-        return clf.predict_proba(x).ravel()
+        P = np.asarray(clf.predict_proba(X))
+        if P.shape[0] == len(X):
+            return P
     except Exception:
-        # Fallback: one-hot of the predicted class.
-        pred = clf.predict(x)[0]
-        return np.array([1.0 if c == pred else 0.0 for c in classes])
+        pass
+    # Fallback: one-hot of the predicted classes.
+    preds = np.asarray(clf.predict(X))
+    return np.array([[1.0 if c == p else 0.0 for c in classes] for p in preds])
 
 
 # ---------------------------------------------------------------------------

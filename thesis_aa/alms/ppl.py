@@ -411,7 +411,11 @@ def score_all_pairs(
             print(f"[ALMs/PPL] {model_tag} x {text_tag}: PPL={ppl:.2f}")
 
         del model
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        # Free the (potentially large) ALM before loading the next one.
+        # CUDA has a cache; xpu/CPU don't, but calling the API when
+        # available keeps memory pressure low on long multi-model runs.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return result_path
 
@@ -428,6 +432,17 @@ def _resstr2list(item: pd.Series, test_text_limit: int | None,
     (tokens, losses, lemmas, ...) are stored as *strings* like
     ``"['the', 'castle', ...]"``. We recover the actual Python lists with
     ``ast.literal_eval``.
+
+    **The losses alignment convention (read this twice).** A causal LM
+    predicts token ``i+1`` from the tokens before it, so a text of ``n``
+    tokens yields exactly ``n-1`` per-token losses: ``losses[j]`` is the NLL
+    of ``tokens[j+1]``. The first token has no left context and is never
+    scored. For storage convenience we *pad* the losses list with a trailing
+    ``0.0`` so it has the same length as ``tokens`` and can be zipped with
+    it 1:1; ``losses_shifted`` then shifts that padded list right by one so
+    that entry ``j`` aligns with ``tokens[j]``. Downstream PPL averages
+    therefore include one constant 0.0 term — a deliberate quirk inherited
+    from the reference notebook's convention.
 
     If ``test_text_limit`` is set, every list is truncated to that many
     tokens — this is the mechanism the thesis uses to study how attribution
@@ -454,16 +469,6 @@ def _resstr2list(item: pd.Series, test_text_limit: int | None,
     return item
 
 
-def _cal_ppl_global(item: pd.Series, text_df_col: str = "text_df") -> pd.Series:
-    """Compute global per-text PPL from the stored token-level dataframe."""
-    text_df = item[text_df_col]
-    for aim in ("losses_shifted", "losses"):
-        losses = list(text_df[aim])
-        ppl = math.exp(sum(losses) / len(losses)) if losses else 0.0
-        item[f"global-ppl:({aim})"] = ppl
-    return item
-
-
 def aggregate_ppl(
     ce_log_home: str = os.path.join(config.RESULTS_DIR, "ce_log"),
     out_home: str = os.path.join(config.RESULTS_DIR, "ppl_dfs_buffer"),
@@ -473,7 +478,14 @@ def aggregate_ppl(
 
     Fix #1 & #2: the original ``CalculatePPL.ipynb`` referenced ``ppl_df``
     without constructing it. Here the full chain is explicit:
-      corpus_df -> _resstr2list -> text_df per row -> _cal_ppl_global -> ppl_df
+      corpus_df -> _resstr2list -> per-row PPL aggregation -> ppl_df
+
+    **Performance note.** Each ``.csv.7z`` pair log is LZMA-compressed and
+    its cells hold stringified Python lists, so parsing is expensive. The
+    thesis sweeps 17 text-length limits (``config.DEFAULT_TEST_TEXT_LIMITS``)
+    and the original implementation re-decompressed and re-parsed every log
+    *per limit* (17x redundant work). Here we parse each log **once**, then
+    derive every limit's truncated view with cheap list slicing.
     """
     if test_text_limits is None:
         test_text_limits = [None]  # full length
@@ -481,7 +493,7 @@ def aggregate_ppl(
 
     fps = [
         os.path.join(ce_log_home, f)
-        for f in os.listdir(ce_log_home)
+        for f in sorted(os.listdir(ce_log_home))
         if f.endswith(".csv.7z")
     ]
     if not fps:
@@ -494,6 +506,24 @@ def aggregate_ppl(
         m, t = _parse_pair_name(base)
         tasks.append((m, t))
 
+    # ---- Pass 1: parse each pair log ONCE into plain Python lists ----
+    # Full-length (untruncated) parsed rows per (model_tag, text_tag) pair.
+    parsed_by_pair: dict[tuple[str, str], list[pd.Series]] = {}
+    for (model_tag, text_tag) in tqdm(tasks, desc="parse CE logs"):
+        fp = os.path.join(ce_log_home, _safe_pair_name(model_tag, text_tag) + ".csv.7z")
+        with zipfile.ZipFile(fp, "r") as z:
+            inner = [n for n in z.namelist() if n.endswith(".csv")][0]
+            with z.open(inner) as f:
+                corpus_df = pd.read_csv(f, names=FEATURE_CATEGORIES, compression=None)
+
+        # test_text_limit=None keeps the full lists (no truncation cost).
+        rows = corpus_df.apply(
+            _resstr2list, axis=1,
+            args=(None, copy.deepcopy(FEATURE_CATEGORIES)),
+        )
+        parsed_by_pair[(model_tag, text_tag)] = list(rows.iterrows())
+
+    # ---- Pass 2: for each limit, truncate the parsed rows and aggregate ----
     output_paths = []
     for limit in test_text_limits:
         label = limit if limit is not None else "full"
@@ -501,30 +531,36 @@ def aggregate_ppl(
         output_paths.append(out_path)
 
         rows = []
-        for (model_tag, text_tag) in tqdm(tasks, desc=f"limit={label}"):
-            fp = os.path.join(ce_log_home, _safe_pair_name(model_tag, text_tag) + ".csv.7z")
-            with zipfile.ZipFile(fp, "r") as z:
-                inner = [n for n in z.namelist() if n.endswith(".csv")][0]
-                with z.open(inner) as f:
-                    corpus_df = pd.read_csv(f, names=FEATURE_CATEGORIES, compression=None)
+        for (model_tag, text_tag) in tasks:
+            parsed_rows = parsed_by_pair[(model_tag, text_tag)]
 
-            corpus_df = corpus_df.apply(
-                _resstr2list, axis=1,
-                args=(limit, copy.deepcopy(FEATURE_CATEGORIES)),
-            )
-            feature_cats = FEATURE_CATEGORIES + ["losses_shifted"]
-            # Build a per-token dataframe for each text, then compute global PPL.
             ppl_rows = []
-            for _, row in corpus_df.iterrows():
-                text_df = pd.DataFrame(
-                    {cat: row[cat] for cat in feature_cats}
-                )
+            for _, row in parsed_rows:
+                if limit is not None:
+                    # Truncate every list feature to the first `limit`
+                    # entries. Cheap: plain list slicing on parsed lists
+                    # (no re-decompression, no ast.literal_eval re-parse).
+                    row = row.copy()
+                    for cat in FEATURE_CATEGORIES:
+                        row[cat] = list(row[cat][:limit])
+                        row[cat + "_count"] = len(row[cat])
+                    # losses must stay aligned to tokens[:-1]; _resstr2list
+                    # padded losses to len(tokens), so truncate likewise and
+                    # keep the trailing 0.0 padding convention.
+                    losses = list(row["losses"][: max(limit - 1, 0)])
+                    losses = losses + [0.0]
+                    row["losses"] = losses
+                    row["losses_count"] = len(losses)
+                    row["losses_shifted"] = [0.0] + losses[:-1]
+                    row["losses_shifted_count"] = len(row["losses_shifted"])
+
+                # Compute the two global-PPL features from the (possibly
+                # truncated) per-token losses.
                 ppl_row = row.copy()
-                ppl_row["text_df"] = None  # drop heavy object
                 for aim in ("losses_shifted", "losses"):
-                    losses = list(text_df[aim])
+                    losses_list = list(ppl_row[aim])
                     ppl_row[f"global-ppl:({aim})"] = (
-                        math.exp(sum(losses) / len(losses)) if len(losses) else 0.0
+                        math.exp(sum(losses_list) / len(losses_list)) if losses_list else 0.0
                     )
                 ppl_row["candidate_tag"] = model_tag
                 ppl_row["true_tag"] = text_tag

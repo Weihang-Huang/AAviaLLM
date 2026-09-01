@@ -56,9 +56,11 @@ if you want very short documents; the generator handles that gracefully.
     <BOS>...document body...<EOS>,author00
     ...
 
-The ``<BOS>`` / ``<EOS>`` markers are stripped before tokenisation in the
-ALMs/LERF pipelines (see ``_clean_text`` patterns) but kept in the CSV so
-the on-disk format matches the reference repo exactly.
+The ``<BOS>`` / ``<EOS>`` markers are kept in the CSV files so the on-disk
+format matches the reference repo exactly; each pipeline strips them with
+inline ``text.replace("<BOS>", "").replace("<EOS>", "")`` calls before
+tokenisation (see ``alms/ppl.py:compute_ce_per_text`` and
+``lerf/estimator.py:lerf_estimate``).
 """
 
 from __future__ import annotations

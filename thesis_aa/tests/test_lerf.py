@@ -137,3 +137,43 @@ def test_lerf_aa_runs_one_classifier(tiny_corpus):
     # Should beat the random baseline.
     n_classes = train_df["author_tag"].nunique()
     assert res["macro_accuracy"].iloc[0] >= 1.0 / n_classes - 1e-9
+
+
+def test_build_classifiers_runs_are_deterministic(tiny_corpus):
+    """Regression: six of the eight classifiers are stochastic (SGD
+    shuffling, random feature subsets) and previously had no random_state,
+    so identical data produced different accuracy tables run-to-run —
+    making debugging and regression testing impossible. All seeded
+    classifiers must now return identical results on repeated runs."""
+    train_df, test_df = tiny_corpus
+    rng = np.random.default_rng(0)
+    # Small synthetic feature matrices (no LERF extraction needed — we are
+    # only testing classifier determinism, not feature quality).
+    X_train = rng.random((12, 200))
+    X_test = rng.random((6, 200))
+    y_train = np.array(["a", "b", "c"] * 4)
+    y_test = np.array(["a", "b", "c"] * 2)
+
+    clfs = {"Linear SVM": lerf_aa.build_classifiers()["Linear SVM"],
+            "Random Forest": lerf_aa.build_classifiers()["Random Forest"],
+            "Decision Tree": lerf_aa.build_classifiers()["Decision Tree"]}
+    r1 = lerf_aa.run_lerf_aa(X_train, y_train, X_test, y_test, classifiers=clfs)
+    r2 = lerf_aa.run_lerf_aa(X_train, y_train, X_test, y_test, classifiers=clfs)
+    assert r1.equals(r2), "stochastic classifiers must be seeded for reproducibility"
+
+
+def test_select_mfw_shared_counting_helper_matches_mle(tiny_corpus):
+    """The shared ``count_token_ids`` helper must produce the same MFW
+    ranking as the (removed) inlined counting loops."""
+    train_df, _ = tiny_corpus
+    from thesis_aa.lerf.estimator import count_token_ids, mle_estimate
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    texts = train_df["text"].tolist()
+    counts = count_token_ids(texts, tokenizer=tok)
+    mle = mle_estimate(texts, tokenizer=tok)
+    total = counts.sum()
+    assert total > 0
+    # MLE is just the normalised counts vector.
+    assert np.allclose(mle, counts / total, atol=1e-12)

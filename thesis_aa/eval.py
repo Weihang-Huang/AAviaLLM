@@ -76,7 +76,19 @@ _TAG_COL = "author_tag"
 # ---------------------------------------------------------------------------
 
 def macro_accuracy(y_true: Sequence, y_pred: Sequence) -> float:
-    """Unweighted mean of per-class accuracy (Ch.4 Sec 4.3)."""
+    """Unweighted mean of per-class accuracy (Ch.4 Sec 4.3).
+
+    "Macro" means every author counts equally regardless of how many test
+    documents they have — a method that nails the populous author but fails
+    the rare one gets punished, unlike micro accuracy.
+
+    Example::
+
+        y_true = ["a", "a", "b", "b", "c", "c"]
+        y_pred = ["a", "a", "b", "b", "c", "a"]
+        # per-class: a=2/2, b=2/2, c=1/2  ->  mean = (1+1+0.5)/3
+        macro_accuracy(y_true, y_pred)   # 0.8333...
+    """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     classes = np.unique(y_true)
@@ -90,7 +102,15 @@ def macro_accuracy(y_true: Sequence, y_pred: Sequence) -> float:
 
 
 def standard_error(values: Sequence[float]) -> float:
-    """Standard error of the mean of repeated-split accuracy estimates."""
+    """Standard error of the mean of repeated-split accuracy estimates.
+
+    Reported in parentheses next to every accuracy in the thesis tables,
+    across repeated train/test splits.
+
+    Example::
+
+        standard_error([0.8, 0.8, 0.9])   # std(ddof=1) / sqrt(3)
+    """
     arr = np.asarray(values, dtype=float)
     if len(arr) <= 1:
         return 0.0
@@ -103,7 +123,18 @@ def top_n_accuracy(ranked_candidates: Sequence[Sequence], y_true: Sequence, n: i
     ``ranked_candidates[i]`` is the ordered list of predicted candidates for
     document ``i`` (best first). Returns the unweighted mean, over true
     classes, of the proportion of that class's documents whose true author
-    appears in the top ``n``.
+    appears in the top ``n``. Useful with many candidates: if the true
+    author makes your top-5 of 50, that is informative even when top-1
+    is wrong.
+
+    Example::
+
+        y_true = ["a", "b"]
+        ranked = [["a", "b"], ["b", "a"]]     # both correct at rank 1
+        top_n_accuracy(ranked, y_true, 1)     # 1.0
+        ranked = [["b", "a"], ["a", "b"]]     # both correct at rank 2
+        top_n_accuracy(ranked, y_true, 1)     # 0.0
+        top_n_accuracy(ranked, y_true, 2)     # 1.0
     """
     y_true = np.asarray(y_true)
     correct_flags = []
@@ -124,7 +155,17 @@ def top_n_accuracy(ranked_candidates: Sequence[Sequence], y_true: Sequence, n: i
 def true_author_rank_stats(ranked_candidates: Sequence[Sequence], y_true: Sequence) -> dict:
     """Distribution of the true author's rank across documents (Ch.5 Table 5).
 
-    Returns mean, std, Q25, Q50 (median), Q75, Q99.
+    The rank is 1-indexed: 1 means the true author was the top prediction.
+    Absent truth degrades to ``len(candidates) + 1`` (worst case).
+
+    Returns ``{"mean", "std", "Q25", "Q50", "Q75", "Q99"}`` — the percentiles
+    summarise "how far down the list is the true author, typically?".
+
+    Example::
+
+        ranked = [["a", "b"], ["b", "a"]]
+        true_author_rank_stats(ranked, ["a", "a"])
+        # {"mean": 1.5, "std": 0.707..., "Q25": 1.25, "Q50": 1.5, ...}
     """
     y_true = np.asarray(y_true)
     ranks = []
@@ -146,7 +187,13 @@ def true_author_rank_stats(ranked_candidates: Sequence[Sequence], y_true: Sequen
 
 
 def per_author_accuracy(y_true: Sequence, y_pred: Sequence) -> dict:
-    """Per-class accuracy keyed by author tag."""
+    """Per-class accuracy keyed by author tag.
+
+    Example::
+
+        per_author_accuracy(["a", "a", "b"], ["a", "b", "b"])
+        # {"a": 0.5, "b": 1.0}
+    """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     out = {}
@@ -174,8 +221,10 @@ def build_benchmark_results_df(
     accuracy.
     """
     rows = []
-    features = list(set(pred_df[by_col].tolist()))
-    true_tags = list(set(pred_df[true_col].tolist()))
+    # Sorted for deterministic output order (set iteration order varies
+    # between runs; tests and notebook outputs should be reproducible).
+    features = sorted(set(pred_df[by_col].tolist()))
+    true_tags = sorted(set(pred_df[true_col].tolist()))
 
     for feature in features:
         sub = pred_df[pred_df[by_col] == feature]
@@ -216,11 +265,20 @@ def summarize_benchmark_dir(bench_dir: str, pattern: str = "*.csv") -> pd.DataFr
     """Read all benchmark result CSVs in ``bench_dir`` and return a summary.
 
     Each CSV is expected to have columns ``feature, true_tag, fscore,
-    precision, recall, accuracy``. The returned frame averages over per-author
-    rows (``true_tag != "GLOBAL"``) and keeps one row per (file, feature).
+    precision, recall, accuracy``. The returned frame averages over
+    per-author rows (``true_tag != "GLOBAL"``) and keeps one row per
+    (file, feature) — i.e. one **macro-accuracy per benchmark file**, the
+    same aggregation the thesis tables report per dataset.
+
+    Example::
+
+        summarize_benchmark_dir(os.path.join(config.RESULTS_DIR,
+                                             'benchmark_results_df_home'))
+        # one row per (file, feature):
+        #   file, feature, macro_accuracy, macro_fscore
     """
     import glob
-    files = glob.glob(os.path.join(bench_dir, pattern))
+    files = sorted(glob.glob(os.path.join(bench_dir, pattern)))
     out = []
     for f in files:
         df = pd.read_csv(f)

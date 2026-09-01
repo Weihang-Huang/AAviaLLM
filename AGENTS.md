@@ -53,6 +53,6 @@ data/           # synthetic/ + benchmarks/ (downloaded subsets)
 - Defaults are CPU-safe and tiny (synthetic data, `gpt2`, 1-2 epochs) so
   pipelines run in seconds. For real runs, raise `epochs` to 100 (Table 2),
   swap to a benchmark via `data.load_benchmark`, and pick a larger GPT-2.
-- `alms/ppl.py` fixes five bugs from the original `CalculatePPL.ipynb`; see
+- `alms/ppl.py` fixes seven bugs from the original `CalculatePPL.ipynb`; see
   the module docstring for the list.
 - Do not commit the downloaded benchmark archives or trained models.

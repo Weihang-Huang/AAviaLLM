@@ -126,6 +126,38 @@ VOCAB_SIZE = config.GPT2_VOCAB_SIZE
 
 
 # ---------------------------------------------------------------------------
+# Shared token counting (used by MLE, standard estimators, and MFW selection)
+# ---------------------------------------------------------------------------
+
+def count_token_ids(
+    texts: list[str] | pd.Series,
+    tokenizer=None,
+    vocab_size: int = VOCAB_SIZE,
+) -> np.ndarray:
+    """Count GPT-2 token-id occurrences across ``texts``.
+
+    This is the shared substrate of three callers that previously each had
+    their own copy of the same loop (MLE, the five classical estimators,
+    and LERF-AA's MFW selection): strip the ``<BOS>``/``<EOS>`` markers,
+    tokenize each text, and tally token ids into a length-``vocab_size``
+    vector. Returns the raw integer counts (NOT normalised).
+    """
+    if tokenizer is None:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    counts = np.zeros(vocab_size, dtype=np.float64)
+    for text in texts:
+        clean = str(text).replace("<BOS>", "").replace("<EOS>", "")
+        if not clean.strip():
+            continue
+        ids = tokenizer(clean, return_tensors="pt").input_ids[0].tolist()
+        for tid in ids:
+            if 0 <= tid < vocab_size:
+                counts[tid] += 1
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # LERF estimation (Ch.6 Sec 6.4.3)
 # ---------------------------------------------------------------------------
 
@@ -204,16 +236,9 @@ def mle_estimate(texts: list[str] | pd.Series, tokenizer=None,
     Counts each token id and divides by the total. Unseen types get 0.
     """
     if tokenizer is None:
+        from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-    counts = np.zeros(vocab_size, dtype=np.float64)
-    for text in texts:
-        clean = str(text).replace("<BOS>", "").replace("<EOS>", "")
-        if not clean.strip():
-            continue
-        ids = tokenizer(clean, return_tensors="pt").input_ids[0].tolist()
-        for tid in ids:
-            if 0 <= tid < vocab_size:
-                counts[tid] += 1
+    counts = count_token_ids(texts, tokenizer=tokenizer, vocab_size=vocab_size)
     total = counts.sum()
     if total == 0:
         return counts
@@ -236,18 +261,11 @@ def standard_estimators(
     summing to 1: Add-One, Good-Turing, Katz-Backoff, Kneser-Ney, Witten-Bell.
     """
     if tokenizer is None:
+        from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    # Observed counts and unigram counts-of-counts.
-    counts = np.zeros(vocab_size, dtype=np.float64)
-    for text in texts:
-        clean = str(text).replace("<BOS>", "").replace("<EOS>", "")
-        if not clean.strip():
-            continue
-        ids = tokenizer(clean, return_tensors="pt").input_ids[0].tolist()
-        for tid in ids:
-            if 0 <= tid < vocab_size:
-                counts[tid] += 1
+    # Observed counts and unigram counts-of-counts (shared counting helper).
+    counts = count_token_ids(texts, tokenizer=tokenizer, vocab_size=vocab_size)
 
     N = counts.sum()
     return {
@@ -428,7 +446,16 @@ def split_corpus(df: pd.DataFrame, eval_frac: float = 0.2, seed: int = 0,
     """Split a corpus into a small evaluation (sample) set and a reference set.
 
     The evaluation set acts as the sample corpus; the reference set represents
-    the full population whose distribution we wish to estimate (Ch.6 Sec 6.5.2).
+    the full population whose distribution we wish to estimate (Ch.6 Sec
+    6.5.2). The intuition is a lab experiment: you get to *see* only a small
+    sample (the eval set) and must estimate the word-frequency table of the
+    whole variety; the reference set is the "answer key" you score against.
+
+    The shuffle is a plain row-level cut (NOT per-author stratified) because
+    the LERF question is about the corpus as one variety of language, not
+    about per-author balance.
+
+    Returns ``(eval_df, reference_df)``.
     """
     shuffled = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
     cut = int(len(shuffled) * eval_frac)

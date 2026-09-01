@@ -76,6 +76,37 @@ def test_train_is_resumable(tiny_corpus):
         assert len(trained) == train_df["author_tag"].nunique() - 1
 
 
+def test_train_authorial_model_skip_check_fires_on_existing_model(tiny_corpus):
+    """Regression: the skip-check used ``os.path.isdir`` on a *file* path
+    (``models/<tag>/config.json``), which is always False — so an already
+    trained author would silently retrain (hours wasted on real runs)
+    whenever ``log/done.txt`` was missing. The check must be ``isfile``.
+    """
+    train_df, _ = tiny_corpus
+    with tempfile.TemporaryDirectory() as model_dir:
+        # Train one author directly.
+        alms_train.train_authorial_model(
+            "author00", train_df, out_dir=model_dir,
+            epochs=1, gradient_accumulation_steps=1, batch_size=1,
+            block_size=64, fp16=False,
+        )
+        marker = os.path.join(model_dir, "author00", "config.json")
+        assert os.path.isfile(marker)
+        # Second call with NO done.txt log: must detect the existing model
+        # and skip (previously it retrained because isdir(file) is False).
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            path = alms_train.train_authorial_model(
+                "author00", train_df, out_dir=model_dir,
+                epochs=1, gradient_accumulation_steps=1, batch_size=1,
+                block_size=64, fp16=False,
+            )
+        assert "already trained, skipping" in buf.getvalue()
+        assert path == os.path.join(model_dir, "author00")
+
+
 def test_score_all_pairs_writes_ce_logs_and_results(tiny_corpus, trained_models):
     _, test_df = tiny_corpus
     with tempfile.TemporaryDirectory() as work:
