@@ -84,7 +84,7 @@ import shutil
 
 import pandas as pd
 import torch
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -184,12 +184,23 @@ def train_authorial_model(
     target_set = _filter_by_author(train_df, author_tag, tag_col)
     if len(target_set) == 0:
         raise ValueError(f"No training rows for author '{author_tag}'.")
-
-    dataset = target_set.train_test_split(test_size=eval_test_size, shuffle=True, seed=seed)
+    if len(target_set) == 1 and eval_test_size > 0:
+        # datasets' train_test_split cannot produce a non-empty train set
+        # from a single row (ValueError). Mirror the reference notebook's
+        # 80/20 design by skipping the held-out eval split entirely and
+        # training on the one document (a 1-doc author cannot be split).
+        print(f"[ALMs] {author_tag}: only 1 training document - "
+              f"training on it without a held-out eval split.")
+        dataset = DatasetDict({"train": target_set})
+    else:
+        dataset = target_set.train_test_split(
+            test_size=eval_test_size, shuffle=True, seed=seed,
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     tokenizer.pad_token = tokenizer.eos_token
 
+    has_eval = "test" in dataset
     lm_dataset = dataset.map(
         _preprocess, fn_kwargs={"tokenizer": tokenizer},
         batched=True, num_proc=1,
@@ -204,7 +215,7 @@ def train_authorial_model(
 
     training_args = TrainingArguments(
         output_dir=buffer_dir,
-        eval_strategy="epoch",
+        eval_strategy="epoch" if has_eval else "no",
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         num_train_epochs=epochs,
@@ -224,7 +235,7 @@ def train_authorial_model(
         args=training_args,
         processing_class=tokenizer,
         train_dataset=lm_dataset["train"],
-        eval_dataset=lm_dataset["test"],
+        eval_dataset=lm_dataset["test"] if has_eval else None,
         data_collator=data_collator,
     )
 
@@ -233,13 +244,17 @@ def train_authorial_model(
     trainer.save_model(save_path)
     tokenizer.save_pretrained(save_path)
 
-    eval_results = trainer.evaluate()
-    eval_loss = eval_results["eval_loss"]
-    perplexity = math.exp(eval_loss) if eval_loss < 50 else float("inf")
-    eval_str = f"Perplexity: {perplexity:.2f}"
-    print(f"[ALMs] {author_tag}: {eval_str}")
-    with open(os.path.join(save_path, "eval.txt"), "a", encoding="utf-8") as f:
-        f.write(eval_str + "\n")
+    if has_eval:
+        eval_results = trainer.evaluate()
+        eval_loss = eval_results["eval_loss"]
+        perplexity = math.exp(eval_loss) if eval_loss < 50 else float("inf")
+        eval_str = f"Perplexity: {perplexity:.2f}"
+        print(f"[ALMs] {author_tag}: {eval_str}")
+        with open(os.path.join(save_path, "eval.txt"), "a", encoding="utf-8") as f:
+            f.write(eval_str + "\n")
+    else:
+        print(f"[ALMs] {author_tag}: no held-out eval split (1 training "
+              f"document); skipping eval.txt.")
 
     if os.path.isdir(buffer_dir):
         shutil.rmtree(buffer_dir)

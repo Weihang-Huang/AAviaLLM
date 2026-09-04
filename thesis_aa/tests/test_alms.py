@@ -144,7 +144,7 @@ def test_aggregate_ppl_fixed_pipeline(tiny_corpus, trained_models):
         )
         out_home = os.path.join(work, "ppl_dfs_buffer")
         paths = alms_ppl.aggregate_ppl(
-            ce_log_home=ce_log_home, out_home=out_home, test_text_limits=[None],
+            ce_log_home=ce_log_home, out_home=out_home,
         )
         assert len(paths) == 1
         ppl_df = pd.read_csv(paths[0])
@@ -156,6 +156,41 @@ def test_aggregate_ppl_fixed_pipeline(tiny_corpus, trained_models):
         for c in ppl_cols:
             assert np.isfinite(ppl_df[c]).all()
             assert (ppl_df[c] > 0).all()
+
+
+def test_ce_log_losses_padding_invariant(tiny_corpus, trained_models):
+    """The CE-log alignment convention: ``losses`` align to ``tokens[1:]``
+    and, once padded for storage, end at exactly ``len(tokens)`` entries
+    (one trailing 0.0 pad). Every downstream PPL average relies on this."""
+    _, test_df = tiny_corpus
+    with tempfile.TemporaryDirectory() as work:
+        ce_log_home = os.path.join(work, "ce_log")
+        result_path = os.path.join(work, "ppl_result.csv")
+        alms_ppl.score_all_pairs(
+            None, test_df,
+            model_dir=trained_models,
+            ce_log_home=ce_log_home,
+            result_path=result_path,
+            use_tagger=False,
+            limit_texts_per_author=2,
+        )
+        import zipfile as _zip
+        pair_fp = os.path.join(ce_log_home, "author00-author00.csv.7z")
+        with _zip.ZipFile(pair_fp) as z:
+            inner = [n for n in z.namelist() if n.endswith(".csv")][0]
+            with z.open(inner) as f:
+                corpus_df = pd.read_csv(f, names=alms_ppl.FEATURE_CATEGORIES,
+                                        compression=None)
+        import ast as _ast
+        for _, row in corpus_df.iterrows():
+            toks = _ast.literal_eval(str(row["tokens"]))
+            losses = _ast.literal_eval(str(row["losses"]))
+            # The CE-log convention: losses align to tokens[1:], possibly
+            # already padded with one trailing 0.0.
+            if len(losses) == len(toks) - 1:
+                losses = losses + [0.0]
+            assert len(losses) == len(toks), \
+                "padded losses must have exactly tokens_count entries"
 
 
 def test_predict_and_benchmark(tiny_corpus, trained_models):
@@ -173,7 +208,7 @@ def test_predict_and_benchmark(tiny_corpus, trained_models):
         )
         out_home = os.path.join(work, "ppl_dfs_buffer")
         ppl_paths = alms_ppl.aggregate_ppl(
-            ce_log_home=ce_log_home, out_home=out_home, test_text_limits=[None],
+            ce_log_home=ce_log_home, out_home=out_home,
         )
         bench_paths = alms_ppl.predict_and_benchmark(
             ppl_paths,
@@ -181,8 +216,39 @@ def test_predict_and_benchmark(tiny_corpus, trained_models):
             benchmark_home=os.path.join(work, "bench"),
         )
         bench = pd.read_csv(bench_paths[0])
-        assert {"feature", "true_tag", "fscore", "precision", "recall", "accuracy"} <= set(bench.columns)
+        assert {"feature", "true_tag", "accuracy"} <= set(bench.columns)
         assert "GLOBAL" in bench["true_tag"].values
+
+
+def test_train_authorial_model_single_document_author(tiny_corpus):
+    """Regression: an author with exactly 1 training document previously
+    crashed (datasets' train_test_split cannot split a single row into a
+    non-empty train + eval set). Now the eval split is skipped and training
+    proceeds on the one document."""
+    train_df, _ = tiny_corpus
+    one_doc = train_df[train_df["author_tag"] == "author00"].head(1).copy()
+    rest = train_df[train_df["author_tag"] != "author00"].copy()
+    df = pd.concat([one_doc, rest], ignore_index=True)
+    with tempfile.TemporaryDirectory() as model_dir, tempfile.TemporaryDirectory() as log_dir:
+        alms_train.train_all_authors(
+            df,
+            out_dir=model_dir,
+            log_home=log_dir,
+            epochs=1,
+            gradient_accumulation_steps=1,
+            batch_size=1,
+            block_size=64,
+            fp16=False,
+        )
+        # All authors trained, including the 1-doc author.
+        trained = sorted(d for d in os.listdir(model_dir)
+                         if os.path.isdir(os.path.join(model_dir, d)))
+        assert "author00" in trained
+        assert len(trained) == df["author_tag"].nunique()
+        # The 1-doc author gets no eval.txt (no held-out eval split).
+        assert not os.path.isfile(os.path.join(model_dir, "author00", "eval.txt"))
+        # Multi-doc authors still get eval.txt.
+        assert os.path.isfile(os.path.join(model_dir, "author01", "eval.txt"))
 
 
 def test_compute_cnll_shape_and_sign():

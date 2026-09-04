@@ -22,9 +22,9 @@ There are three stages, each a public function:
   1. ``score_all_pairs``  — score every (author-model, test-author) pair and
                              write per-token cross-entropy logs + a PPL table.
   2. ``aggregate_ppl``    — turn the raw per-token logs into one per-text PPL
-                             value (for different text-length cutoffs).
+                             value.
   3. ``predict_and_benchmark`` — attribute each test text to the argmin-PPL
-                             author and compute accuracy / F1 / recall.
+                             author and compute accuracy.
 
 A fourth function, ``compute_cnll``, implements the token-level Comparative
 Negative Log-Likelihood from Ch.5 Sec 5.3.3 (used for interpretability).
@@ -71,9 +71,9 @@ auditable:
      no connecting assignment. Fix: a single explicit loop.
 
   3. **Global-variable leakage under multiprocessing.** ``resstr2list`` and
-     ``corpusrow2textdf`` read ``test_text_limit`` and ``feature_categories``
-     as bare globals. With ``pandarallel``/``multiprocess`` these can be
-     undefined in worker processes. Fix: pass them as explicit ``args=``.
+     ``corpusrow2textdf`` read ``feature_categories`` as a bare global. With
+     ``pandarallel``/``multiprocess`` it can be undefined in worker
+     processes. Fix: pass it as an explicit ``args=``.
 
   4. **``CrossEntropyLoss`` re-instantiated per token.** The original created
      a new ``CrossEntropyLoss()`` inside the per-token inner loop (thousands
@@ -107,7 +107,7 @@ auditable:
     from thesis_aa import config, data as data_mod
     from thesis_aa.alms import ppl as alms_ppl
 
-    train_df, test_df = data_mod.generate_synthetic()   # or load_benchmark
+    train_df, test_df = data_mod.load_natural()  # or load_benchmark
     # (assume models already trained under config.MODEL_DIR via alms.train)
 
     result_path = alms_ppl.score_all_pairs(
@@ -115,7 +115,7 @@ auditable:
     )
     ppl_paths = alms_ppl.aggregate_ppl()
     bench_paths = alms_ppl.predict_and_benchmark(ppl_paths)
-    # bench_paths[0] is a CSV with macro-accuracy / F1 / precision / recall,
+    # bench_paths[0] is a CSV with accuracy (macro-accuracy per author),
     # one row per "feature" (e.g. global-ppl:(losses)) plus one per author.
 """
 
@@ -421,12 +421,12 @@ def score_all_pairs(
 
 
 # ---------------------------------------------------------------------------
-# Aggregate per-text PPL across test-text limits (fixed pipeline)
+# Aggregate per-text PPL (fixed pipeline)
 # ---------------------------------------------------------------------------
 
-def _resstr2list(item: pd.Series, test_text_limit: int | None,
+def _resstr2list(item: pd.Series,
                  feature_categories: list[str]) -> pd.Series:
-    """Parse stringified lists in a CE-log row and truncate to text limit.
+    """Parse stringified lists in a CE-log row.
 
     When a CE-log CSV is read back with ``pd.read_csv`` the list-valued cells
     (tokens, losses, lemmas, ...) are stored as *strings* like
@@ -444,19 +444,12 @@ def _resstr2list(item: pd.Series, test_text_limit: int | None,
     therefore include one constant 0.0 term — a deliberate quirk inherited
     from the reference notebook's convention.
 
-    If ``test_text_limit`` is set, every list is truncated to that many
-    tokens — this is the mechanism the thesis uses to study how attribution
-    accuracy changes with questioned-text length (Ch.5 Sec 5.4.1, the
-    "test_text_limits" analysis). Pass ``None`` to keep the full length.
-
-    Fix #3: ``test_text_limit`` and ``feature_categories`` are passed as
-    arguments (via ``DataFrame.apply(..., args=...)``) rather than read as
-    globals, so they survive under multiprocessing.
+    Fix #3: ``feature_categories`` is passed as an argument (via
+    ``DataFrame.apply(..., args=...)``) rather than read as a global, so it
+    survives under multiprocessing.
     """
     for cat in feature_categories:
         val = ast.literal_eval(str(item[cat]))
-        if test_text_limit is not None and isinstance(test_text_limit, int):
-            val = val[:test_text_limit]
         item[cat] = val
         item[cat + "_count"] = len(val)
     # losses are aligned to tokens[:-1]; pad to len(tokens).
@@ -472,23 +465,20 @@ def _resstr2list(item: pd.Series, test_text_limit: int | None,
 def aggregate_ppl(
     ce_log_home: str = os.path.join(config.RESULTS_DIR, "ce_log"),
     out_home: str = os.path.join(config.RESULTS_DIR, "ppl_dfs_buffer"),
-    test_text_limits: list[int] | None = None,
 ) -> list[str]:
-    """Aggregate per-text PPL for each test-text limit.
+    """Aggregate per-text PPL for each (model, author) pair.
 
     Fix #1 & #2: the original ``CalculatePPL.ipynb`` referenced ``ppl_df``
     without constructing it. Here the full chain is explicit:
       corpus_df -> _resstr2list -> per-row PPL aggregation -> ppl_df
 
-    **Performance note.** Each ``.csv.7z`` pair log is LZMA-compressed and
-    its cells hold stringified Python lists, so parsing is expensive. The
-    thesis sweeps 17 text-length limits (``config.DEFAULT_TEST_TEXT_LIMITS``)
-    and the original implementation re-decompressed and re-parsed every log
-    *per limit* (17x redundant work). Here we parse each log **once**, then
-    derive every limit's truncated view with cheap list slicing.
+    Each ``.csv.7z`` pair log is LZMA-compressed and its cells hold
+    stringified Python lists, so parsing is expensive; each log is parsed
+    exactly once.
+
+    The output is a single tidy CSV (``ppl_dfs_buffer.csv``) with one row per
+    (test text, candidate ALM) and one ``global-ppl:(*)`` column per feature.
     """
-    if test_text_limits is None:
-        test_text_limits = [None]  # full length
     os.makedirs(out_home, exist_ok=True)
 
     fps = [
@@ -506,9 +496,7 @@ def aggregate_ppl(
         m, t = _parse_pair_name(base)
         tasks.append((m, t))
 
-    # ---- Pass 1: parse each pair log ONCE into plain Python lists ----
-    # Full-length (untruncated) parsed rows per (model_tag, text_tag) pair.
-    parsed_by_pair: dict[tuple[str, str], list[pd.Series]] = {}
+    rows = []
     for (model_tag, text_tag) in tqdm(tasks, desc="parse CE logs"):
         fp = os.path.join(ce_log_home, _safe_pair_name(model_tag, text_tag) + ".csv.7z")
         with zipfile.ZipFile(fp, "r") as z:
@@ -516,66 +504,35 @@ def aggregate_ppl(
             with z.open(inner) as f:
                 corpus_df = pd.read_csv(f, names=FEATURE_CATEGORIES, compression=None)
 
-        # test_text_limit=None keeps the full lists (no truncation cost).
-        rows = corpus_df.apply(
+        ppl_rows = []
+        for _, row in corpus_df.apply(
             _resstr2list, axis=1,
-            args=(None, copy.deepcopy(FEATURE_CATEGORIES)),
-        )
-        parsed_by_pair[(model_tag, text_tag)] = list(rows.iterrows())
+            args=(copy.deepcopy(FEATURE_CATEGORIES),),
+        ).iterrows():
+            # Compute the two global-PPL features from the per-token losses.
+            ppl_row = row.copy()
+            for aim in ("losses_shifted", "losses"):
+                losses_list = list(ppl_row[aim])
+                ppl_row[f"global-ppl:({aim})"] = (
+                    math.exp(sum(losses_list) / len(losses_list)) if losses_list else 0.0
+                )
+            ppl_row["candidate_tag"] = model_tag
+            ppl_row["true_tag"] = text_tag
+            # text_num is unique only *within* a (candidate, true-author)
+            # pair — predict_and_benchmark must group by both keys.
+            ppl_row["text_num"] = len(ppl_rows)
+            ppl_rows.append(ppl_row)
 
-    # ---- Pass 2: for each limit, truncate the parsed rows and aggregate ----
-    output_paths = []
-    for limit in test_text_limits:
-        label = limit if limit is not None else "full"
-        out_path = os.path.join(out_home, f"ppl_dfs_buffer-{label}.csv")
-        output_paths.append(out_path)
+        rows.extend(ppl_rows)
 
-        rows = []
-        for (model_tag, text_tag) in tasks:
-            parsed_rows = parsed_by_pair[(model_tag, text_tag)]
+    out_path = os.path.join(out_home, "ppl_dfs_buffer.csv")
+    ppl_dfs = pd.DataFrame(rows)
+    cols = [c for c in ppl_dfs.columns if c.startswith("global-ppl:")]
+    ppl_dfs = ppl_dfs[["true_tag", "candidate_tag", "text_num"] + cols]
+    ppl_dfs.to_csv(out_path, index=False)
+    print(f"[ALMs/PPL] wrote {out_path}")
 
-            ppl_rows = []
-            for _, row in parsed_rows:
-                if limit is not None:
-                    # Truncate every list feature to the first `limit`
-                    # entries. Cheap: plain list slicing on parsed lists
-                    # (no re-decompression, no ast.literal_eval re-parse).
-                    row = row.copy()
-                    for cat in FEATURE_CATEGORIES:
-                        row[cat] = list(row[cat][:limit])
-                        row[cat + "_count"] = len(row[cat])
-                    # losses must stay aligned to tokens[:-1]; _resstr2list
-                    # padded losses to len(tokens), so truncate likewise and
-                    # keep the trailing 0.0 padding convention.
-                    losses = list(row["losses"][: max(limit - 1, 0)])
-                    losses = losses + [0.0]
-                    row["losses"] = losses
-                    row["losses_count"] = len(losses)
-                    row["losses_shifted"] = [0.0] + losses[:-1]
-                    row["losses_shifted_count"] = len(row["losses_shifted"])
-
-                # Compute the two global-PPL features from the (possibly
-                # truncated) per-token losses.
-                ppl_row = row.copy()
-                for aim in ("losses_shifted", "losses"):
-                    losses_list = list(ppl_row[aim])
-                    ppl_row[f"global-ppl:({aim})"] = (
-                        math.exp(sum(losses_list) / len(losses_list)) if losses_list else 0.0
-                    )
-                ppl_row["candidate_tag"] = model_tag
-                ppl_row["true_tag"] = text_tag
-                ppl_row["text_num"] = len(ppl_rows)
-                ppl_rows.append(ppl_row)
-
-            rows.extend(ppl_rows)
-
-        ppl_dfs = pd.DataFrame(rows)
-        cols = [c for c in ppl_dfs.columns if c.startswith("global-ppl:")]
-        ppl_dfs = ppl_dfs[["true_tag", "candidate_tag", "text_num"] + cols]
-        ppl_dfs.to_csv(out_path, index=False)
-        print(f"[ALMs/PPL] wrote {out_path}")
-
-    return output_paths
+    return [out_path]
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +548,7 @@ def predict_and_benchmark(
 
     For each PPL buffer CSV, for each ``global-ppl:(*)`` feature, attribute
     each test text to the candidate with the lowest PPL (argmin). Then compute
-    macro F1/precision/recall/accuracy globally and per true author.
+    accuracy globally and per true author (the manuscript's reported metric).
     """
     from ..eval import build_benchmark_results_df
 
@@ -600,9 +557,8 @@ def predict_and_benchmark(
     bench_paths = []
 
     for ppl_path in ppl_dfs_paths:
-        stem = os.path.basename(ppl_path).replace(".csv", "")
-        pred_path = os.path.join(pred_home, f"pred_df_buffer-{stem}.csv")
-        bench_path = os.path.join(benchmark_home, f"benchmark_results_df_buffer-{stem}.csv")
+        pred_path = os.path.join(pred_home, "pred_df_buffer.csv")
+        bench_path = os.path.join(benchmark_home, "benchmark_results_df_buffer.csv")
         bench_paths.append(bench_path)
 
         ppl_df = pd.read_csv(ppl_path)

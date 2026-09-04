@@ -50,12 +50,14 @@ Supporting modules (used by all three methods):
     from thesis_aa import config, data as data_mod
     from thesis_aa.alms import train as alms_train, ppl as alms_ppl
 
-    # 1. A tiny 3-author practice corpus (generated locally in ms).
-    train_df, test_df = data_mod.generate_synthetic(
-        n_authors=3, n_train_docs=6, n_test_docs=3, seed=0)
+    # 1. A small natural-English demo corpus shipped with the repo.
+    train_df, test_df = data_mod.load_natural()
+    keep = {"author00", "author01", "author02"}
+    train_df = train_df[train_df["author_tag"].isin(keep)].reset_index(drop=True)
+    test_df = test_df[test_df["author_tag"].isin(keep)].reset_index(drop=True)
 
-    # 2. One GPT-2 per author (debug hyperparameters: seconds on CPU).
-    alms_train.train_all_authors(train_df, epochs=2, block_size=64,
+    # 2. One GPT-2 per author (demo hyperparameters; ~10 min/author on xpu).
+    alms_train.train_all_authors(train_df, epochs=15, block_size=64,
                                  batch_size=1, fp16=False)
 
     # 3. Score every (model, author) pair and attribute by lowest PPL.

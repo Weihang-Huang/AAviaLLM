@@ -30,8 +30,10 @@ how well it did. This module implements the metrics the thesis reports:
 
   * **benchmark results table** — the ``benchmark_results_df`` schema from
     ``CalculatePPL.ipynb``: one row per (feature, group) where group is either
-    "GLOBAL" or one author tag, with columns F1 / precision / recall /
-    accuracy. This is what the ALMs pipeline writes to disk.
+    "GLOBAL" or one author tag, with an accuracy column. (The original
+    notebook also writes F1 / precision / recall columns; those are omitted
+    here because the manuscript reports accuracy only.) This is what the
+    ALMs pipeline writes to disk.
 
 All functions accept plain Python lists or numpy arrays, so they are easy to
 unit-test without pandas. The benchmark aggregation helpers accept pandas
@@ -61,12 +63,7 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-)
+from sklearn.metrics import accuracy_score
 
 _TAG_COL = "author_tag"
 
@@ -217,8 +214,9 @@ def build_benchmark_results_df(
 
     Mirrors the ``pred_df_2_benchmark_results_df`` function in the original
     ``CalculatePPL.ipynb``: for each feature in ``by_col`` and for the global
-    population plus each true author, compute macro F1 / precision / recall /
-    accuracy.
+    population plus each true author, compute accuracy. (The original
+    notebook also computes F1 / precision / recall; those columns are
+    omitted for manuscript alignment.)
     """
     rows = []
     # Sorted for deterministic output order (set iteration order varies
@@ -242,17 +240,12 @@ def build_benchmark_results_df(
 
 
 def _metric_row(feature: str, tag: str, yt: list, yp: list) -> dict:
+    """One benchmark row: accuracy (the manuscript's reported metric)."""
     if len(yt) == 0:
-        return {"feature": feature, "true_tag": tag, "fscore": 0.0,
-                "precision": 0.0, "recall": 0.0, "accuracy": 0.0}
-    avg = "macro"
-    zero = len(set(yt)) < 2  # can't compute macro metrics with one class
+        return {"feature": feature, "true_tag": tag, "accuracy": 0.0}
     return {
         "feature": feature,
         "true_tag": tag,
-        "fscore": 0.0 if zero else f1_score(yt, yp, average=avg, zero_division=0),
-        "precision": 0.0 if zero else precision_score(yt, yp, average=avg, zero_division=0),
-        "recall": 0.0 if zero else recall_score(yt, yp, average=avg, zero_division=0),
         "accuracy": accuracy_score(yt, yp),
     }
 
@@ -264,18 +257,18 @@ def _metric_row(feature: str, tag: str, yt: list, yp: list) -> dict:
 def summarize_benchmark_dir(bench_dir: str, pattern: str = "*.csv") -> pd.DataFrame:
     """Read all benchmark result CSVs in ``bench_dir`` and return a summary.
 
-    Each CSV is expected to have columns ``feature, true_tag, fscore,
-    precision, recall, accuracy``. The returned frame averages over
-    per-author rows (``true_tag != "GLOBAL"``) and keeps one row per
-    (file, feature) — i.e. one **macro-accuracy per benchmark file**, the
-    same aggregation the thesis tables report per dataset.
+    Each CSV is expected to have columns ``feature, true_tag, accuracy``.
+    The returned frame averages over per-author rows (``true_tag !=
+    "GLOBAL"``) and keeps one row per (file, feature) — i.e. one
+    **macro-accuracy per benchmark file**, the same aggregation the thesis
+    tables report per dataset.
 
     Example::
 
         summarize_benchmark_dir(os.path.join(config.RESULTS_DIR,
                                              'benchmark_results_df_home'))
         # one row per (file, feature):
-        #   file, feature, macro_accuracy, macro_fscore
+        #   file, feature, macro_accuracy
     """
     import glob
     files = sorted(glob.glob(os.path.join(bench_dir, pattern)))
@@ -288,6 +281,5 @@ def summarize_benchmark_dir(bench_dir: str, pattern: str = "*.csv") -> pd.DataFr
                 "file": os.path.basename(f),
                 "feature": feature,
                 "macro_accuracy": grp["accuracy"].mean(),
-                "macro_fscore": grp["fscore"].mean(),
             })
     return pd.DataFrame(out)

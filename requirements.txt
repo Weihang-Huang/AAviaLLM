@@ -1,8 +1,8 @@
 # Core (versions known to work with the thesis_aa package)
 torch>=2.0
-transformers>=4.30
+transformers>=4.46
 datasets>=2.10
-scikit-learn>=1.1
+scikit-learn>=1.4  # HistGradientBoosting max_features and current AdaBoost API
 spacy>=3.5
 pandas>=2.0
 numpy>=1.24

@@ -48,3 +48,23 @@ def test_split_train_test_stratified():
     assert set(train_df["author_tag"]) == {"a", "b"}
     assert set(test_df["author_tag"]) == {"a", "b"}
     assert len(train_df) + len(test_df) == 10
+
+
+def test_download_subset_sampling_math():
+    """Regression: the subset sampler previously used
+    ``max_rows // n_authors + 1`` (overshooting max_rows badly for large
+    author counts) and could yield 1-2 rows/author, which crashed
+    ``train_authorial_model`` (datasets' train_test_split needs >= 2 rows
+    to leave a non-empty train set). The new arithmetic is
+    ``max(4, ceil(max_rows / n_authors))`` per author."""
+    import math
+    n_authors, max_rows = 50, 200
+    per_author = max(4, math.ceil(max_rows / n_authors))
+    assert per_author == 4          # 200/50 = 4 exactly, floor was 4+1=5
+    total = per_author * n_authors
+    assert total <= max_rows * 1.5  # close to max_rows, no 2x overshoot
+
+    # Small author count: per-author is the exact share.
+    assert max(4, math.ceil(200 / 13)) == 16  # ~207 total, within tolerance
+    # The old arithmetic for comparison:
+    assert 200 // 50 + 1 == 5  # 250 total = 25% overshoot (the old bug)

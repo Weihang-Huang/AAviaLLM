@@ -32,6 +32,13 @@ Step 1 — Feature extraction (``extract_lerf_features``):
     ``(n_documents, 50257)`` matrix — one LERF profile per document. The
     model is *frozen* (no training): every document gets the same GPT-2.
 
+    The thesis's key attribution comparison (Ch.7 Tables 7.3 vs 7.4) pits
+    these LERF features against the *observed* relative-frequency baseline
+    (``extract_observed_rf_features``): the same vocabulary, the same
+    classifiers, the only difference being whether feature values come
+    from the LLM's context-informed expectations (LERF) or plain token
+    counts within each document (observed RF).
+
 Step 2 — Feature selection (``select_mfw``):
     The full 50,257-dim vector is often more than a classifier needs. We
     rank vocabulary types by their *observed training* frequency and keep
@@ -69,11 +76,13 @@ verbatim from the manuscript:
                           probabilities (bag-of-words assumption).
   - **Decision Tree**     max_depth=50, max_features="sqrt" — interpretable
                           single tree; an ablation reference for the ensembles.
-  - **AdaBoost**          30 stumps (depth-1) — boosting over very shallow
-                          base learners; tests iterative reweighting.
-  - **Hist GB**           30 iters, max_depth=3 — histogram-based gradient
-                          boosting (the classical GBM is infeasible at 50k
-                          dims because of its O(n*d) per-split cost).
+  - **AdaBoost**          30 stumps (depth-1, sqrt features at each stump's
+                           split) — boosting over very shallow base learners;
+                           tests iterative reweighting.
+  - **Hist GB**           30 iters, max_depth=3, 10% of features per fit —
+                           histogram-based gradient boosting (the classical
+                           GBM is infeasible at 50k dims because of its
+                           O(n*d) per-split cost).
 
 **Why these eight and not others?** The thesis excludes classifiers whose
 complexity scales super-linearly with feature dimension (e.g. libsvm SVC,
@@ -87,7 +96,7 @@ overfit severely given the modest number of training documents per author.
     from thesis_aa import config, data as data_mod
     from thesis_aa.lerf import lerf_aa
 
-    train_df, test_df = data_mod.generate_synthetic()
+    train_df, test_df = data_mod.load_natural()
     results = lerf_aa.full_pipeline(
         train_df, test_df,
         model_name='gpt2',           # or 'gpt2-xl' for the thesis config
@@ -159,6 +168,53 @@ def extract_lerf_features(
     return X
 
 
+def extract_observed_rf_features(
+    df: pd.DataFrame,
+    model_name: str = "gpt2",
+    text_col: str = "text",
+    show_progress: bool = True,
+) -> np.ndarray:
+    """Extract the *observed* relative-frequency profile of every document.
+
+    This is the baseline condition against which the thesis evaluates
+    LERF-AA (Ch.7 Sec 7.3.2, Tables 7.3 vs 7.4): "In the observed relative
+    frequency condition, each feature value is calculated by dividing the
+    number of occurrences of the type in the document by the document's
+    total number of GPT-2 BPE tokens. When the full vocabulary is
+    retained, types not attested in a document receive an observed
+    relative frequency of zero."
+
+    Same shape and unit as :func:`extract_lerf_features` — one row per
+    document, one column per vocabulary type, each row summing to 1 (rows
+    for *empty* documents sum to 0: no tokens means no observed
+    frequencies) — so the two conditions can be fed to identical
+    classifiers with identical MFW selection and differ *only* in how the
+    feature values are obtained (Sec 7.3.2: "The LERF and observed
+    relative frequency conditions therefore differ only in how their
+    feature values are obtained."). Needs only a tokenizer — no model
+    download, no inference.
+    """
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    n = len(df)
+    vocab_size = VOCAB_SIZE
+    X = np.zeros((n, vocab_size), dtype=np.float64)
+    it = tqdm(range(n), desc="Observed-RF features") if show_progress else range(n)
+    for i in it:
+        clean = str(df[text_col].iloc[i]).replace("<BOS>", "").replace("<EOS>", "")
+        if not clean.strip():
+            continue
+        ids = tokenizer(clean).input_ids
+        if not ids:
+            continue
+        for tid in ids:
+            if 0 <= tid < vocab_size:
+                X[i, tid] += 1.0
+        X[i] /= len(ids)
+    return X
+
+
 # ---------------------------------------------------------------------------
 # Step 2: most-frequent-word selection (Sec 7.3.2)
 # ---------------------------------------------------------------------------
@@ -221,8 +277,11 @@ def build_classifiers() -> Dict[str, object]:
       - Extra Trees      : 100 trees, max_depth=50, max_features="sqrt"
       - Gaussian NB      : default
       - Decision Tree    : max_depth=50, max_features="sqrt"
-      - AdaBoost         : 30 stumps (depth-1), max_features="sqrt" via base estimator
-      - Hist GB          : 30 iters, max_depth=3
+      - AdaBoost         : 30 stumps (depth-1, max_features="sqrt" on the
+                           base estimator — Sec 7.3.3 specifies sqrt at the
+                           stump's split)
+      - Hist GB          : 30 iters, max_depth=3, max_features=0.1 (Sec 7.3.3:
+                           "10% of the available features during fitting")
 
     **Reproducibility note.** Six of the eight are stochastic (SGD shuffling,
     random feature subsets, bootstrap sampling). Without a seed, repeated
@@ -244,11 +303,18 @@ def build_classifiers() -> Dict[str, object]:
                                                  random_state=0),
         "AdaBoost": AdaBoostClassifier(
             n_estimators=30,
-            estimator=DecisionTreeClassifier(max_depth=1, random_state=0),
+            # Ch.7 Sec 7.3.3: "AdaBoost uses 30 decision stumps, each with a
+            # maximum depth of one and the square root of the available
+            # features considered at its split".
+            estimator=DecisionTreeClassifier(
+                max_depth=1, max_features="sqrt", random_state=0,
+            ),
             random_state=0,
         ),
         "Histogram Gradient Boosting": HistGradientBoostingClassifier(
-            max_iter=30, max_depth=3, random_state=0,
+            # Ch.7 Sec 7.3.3: "30 boosting iterations, a maximum tree depth
+            # of three, and 10% of the available features during fitting".
+            max_iter=30, max_depth=3, max_features=0.1, random_state=0,
         ),
     }
     return clf
@@ -325,11 +391,15 @@ def _batched_scores(clf, X: np.ndarray, classes) -> np.ndarray:
         ``predict`` results (rank degenerates to putting the predicted
         class first, all others tied).
 
-    **Binary edge case:** For a 2-class problem ``decision_function`` returns
-    a 1-D array (the score for the *positive* class only). We expand it to
-    ``[s, -s]`` per instance so the two classes get symmetric scores and the
-    ranking still works. This case doesn't arise in the thesis (>=7
-    candidate authors) but we handle it for correctness on tiny tests.
+    **Binary edge case:** For a 2-class problem ``decision_function``
+    returns a 1-D array holding the signed score of the *positive* class
+    only (``clf.classes_[1]`` — the second class in sorted order). We
+    expand it to ``[-S, +S]`` so column 0 (the first class, in ``classes``
+    order) gets ``-S`` and column 1 (the positive class) gets ``+S``.
+    Assigning ``S`` to the first class's column would invert the ranking —
+    the predicted class would rank *last* whenever its score is positive.
+    This case doesn't arise in the thesis (>= 7 candidate authors) but we
+    handle it for correctness on tiny tests.
 
     **Batching note:** this replaces the former one-instance-at-a-time
     helper (``_per_instance_scores``); computing scores for all test
@@ -340,8 +410,8 @@ def _batched_scores(clf, X: np.ndarray, classes) -> np.ndarray:
     try:
         S = clf.decision_function(X)
         S = np.asarray(S)
-        if S.ndim == 1:  # binary: (n,) -> (n, 2) with symmetric scores
-            S = np.column_stack([S, -S])
+        if S.ndim == 1:  # binary: (n,) -> (n, 2); S is the score of classes_[1]
+            S = np.column_stack([-S, S])
         if S.shape[0] == len(X):
             return S
     except Exception:

@@ -10,15 +10,24 @@ author. This module provides three ways to get such a corpus:
   1. **``generate_synthetic``** — create a tiny fake corpus on the fly. Each
      author has a distinct "lexicon" of content words (castles, circuits,
      gardens, harbours, ledgers) so attribution is actually learnable. This
-     is what the tests and CPU debugging use: it runs in milliseconds and
-     needs no network. The schema matches the real benchmarks so you can
+     is what the pytest suite and CPU debugging use: it runs in milliseconds
+     and needs no network. The schema matches the real benchmarks so you can
      swap it out for real data without changing any downstream code.
 
-  2. **``load_benchmark``** / **``load_synthetic``** — load a previously
-     saved corpus (real or synthetic) from disk. Real benchmarks come as
-     ``train.csv`` / ``test.csv`` pairs under ``data/benchmarks/<name>/``.
+  2. **``load_natural``** — load the small natural-English demo corpus that
+     ships with the repository (``data/natural/``): five author personas,
+     each writing in a distinct topical domain (castle life, ocean science,
+     cookery, law, polar travel). Its texts are ordinary English prose, so
+     its word statistics resemble real corpora — the LERF and LERF-AA demo
+     notebooks use it to replicate the thesis's directional results at demo
+     scale. Loads instantly after cloning.
 
-  3. **``download_benchmark_subset``** — fetch a benchmark CSV archive from
+  3. **``load_benchmark`` / ``load_synthetic`` / ``load_natural``** — load a
+     previously saved corpus (real, natural, or synthetic) from disk. Real
+     benchmarks come as ``train.csv`` / ``test.csv`` pairs under
+     ``data/benchmarks/<name>/``.
+
+  4. **``download_benchmark_subset``** — fetch a benchmark CSV archive from
      the ALMs GitHub repo, extract it, and sample a small stratified subset.
      Useful for sanity-checking on real data without downloading the full
      corpus. Requires ``py7zr`` (or a ``7z`` executable) for extraction.
@@ -27,6 +36,25 @@ All loaders return ``(train_df, test_df)`` — two pandas DataFrames with
 columns ``["text", "author_tag"]``. The ``text`` column contains documents
 wrapped in ``<BOS>`` / ``<EOS>`` markers, matching the schema used in the
 ALMs repo's benchmark CSVs.
+
+==========================================================================
+  THE TWO DEMO CORPORA (which one do I use?)
+==========================================================================
+
+**Synthetic corpus** (``generate_synthetic``) — pseudo-English "word
+salad", generated on the fly in milliseconds. Used by the pytest suite and
+for debugging pipeline mechanics (shapes, schemas, file plumbing). Its
+word statistics are unlike real prose, so it is *not* suitable for
+demonstrating the LERF estimation results.
+
+**Natural demo corpus** (``load_natural``, ``data/natural/``) — ordinary
+English prose by five author personas in distinct topical domains, shipped
+as CSVs so it is available immediately after cloning. This is what the
+demo notebooks use, because the thesis's methods (and especially LERF)
+are defined over natural language.
+
+For the real benchmarks used in the thesis (Blogs50, CCAT50, Guardian,
+IMDB62), see ``download_benchmark_subset`` / ``load_benchmark``.
 
 ==========================================================================
   SYNTHETIC GENERATOR — how it works
@@ -65,6 +93,7 @@ tokenisation (see ``alms/ppl.py:compute_ce_per_text`` and
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import urllib.request
@@ -154,6 +183,35 @@ def generate_synthetic(
     train_df.to_csv(os.path.join(save_dir, "train.csv"), index=False, encoding="utf-8")
     test_df.to_csv(os.path.join(save_dir, "test.csv"), index=False, encoding="utf-8")
     return train_df, test_df
+
+
+# ---------------------------------------------------------------------------
+# Natural demo corpus loader
+# ---------------------------------------------------------------------------
+
+def load_natural(root: str | None = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load the small natural-English demo corpus shipped with the repo.
+
+    Returns ``(train_df, test_df)`` with the standard ``text`` /
+    ``author_tag`` schema (texts wrapped in ``<BOS>``/``<EOS>`` markers,
+    matching the benchmark CSVs): 50 training and 20 test documents for
+    each of five authors.
+
+    The corpus is a small collection of natural-English prose in which
+    each author persona writes in a distinct topical domain — castle life
+    and chronicles, ocean science, courtroom proceedings, cookery, and
+    polar travel — so that authorship is learnable while the language
+    itself remains ordinary English. Unlike the instant synthetic corpus
+    (see :func:`generate_synthetic`), its word statistics resemble real
+    prose, which is what the LERF experiments (Ch.6) need: the demo
+    notebooks use it to replicate the thesis's directional results, and it
+    loads immediately after cloning (no network, no model download).
+
+    See ``README.md`` for how to swap in the real benchmarks.
+    """
+    if root is None:
+        root = config.NATURAL_DIR
+    return load_csv_split(root)
 
 
 # ---------------------------------------------------------------------------
@@ -265,10 +323,17 @@ def download_benchmark_subset(
             f"Downloaded {name} missing required columns: {list(full.columns)}"
         )
 
-    # Sample a small stratified subset.
+    # Sample a small stratified subset: aim for ceil(max_rows / n_authors)
+    # rows per author so the total stays close to max_rows (the previous
+    # `max_rows // nunique() + 1` could overshoot badly for large author
+    # counts). At least 4 rows per author are kept so the downstream 80/20
+    # train/eval split (train_authorial_model) never faces a single-document
+    # author, which datasets' train_test_split cannot handle.
+    n_authors = full[TAG_COL].nunique()
+    per_author = max(4, math.ceil(max_rows / n_authors))
     sampled = (
         full.groupby(TAG_COL, group_keys=False)
-        .apply(lambda g: g.head(max_rows // full[TAG_COL].nunique() + 1))
+        .apply(lambda g: g.head(per_author))
         .reset_index(drop=True)
     )
     train_df, test_df = split_train_test(sampled, test_size=0.2, seed=0)

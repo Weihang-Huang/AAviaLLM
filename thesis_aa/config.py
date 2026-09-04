@@ -46,12 +46,14 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 SYNTHETIC_DIR = os.path.join(DATA_DIR, "synthetic")
+NATURAL_DIR = os.path.join(DATA_DIR, "natural")
 BENCHMARK_DIR = os.path.join(DATA_DIR, "benchmarks")
 MODEL_DIR = os.path.join(ROOT_DIR, "models")
 LOG_DIR = os.path.join(ROOT_DIR, "log")
 RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 
-for _d in (DATA_DIR, SYNTHETIC_DIR, BENCHMARK_DIR, MODEL_DIR, LOG_DIR, RESULTS_DIR):
+for _d in (DATA_DIR, SYNTHETIC_DIR, NATURAL_DIR, BENCHMARK_DIR, MODEL_DIR,
+           LOG_DIR, RESULTS_DIR):
     os.makedirs(_d, exist_ok=True)
 
 # GPT-2 variants evaluated in the thesis (Ch.5 Table 2, Ch.6, Ch.7).
@@ -91,10 +93,6 @@ STANDARD_ESTIMATORS = [
     "Kneser-Ney",
     "Witten-Bell",
 ]
-
-# Test text lengths evaluated for ALMs token-level analysis (from CalculatePPL.ipynb).
-DEFAULT_TEST_TEXT_LIMITS = [100, 200, 300, 400, 50, 150, 250, 350, 450,
-                            10, 20, 30, 40, 60, 70, 80, 90]
 
 # Benchmark datasets used in the thesis (Ch.4 Sec 4.1).
 BENCHMARKS = ["Blogs50", "CCAT50", "Guardian", "IMDB62"]

@@ -86,14 +86,24 @@ probability mass better than raw MLE (which gives unseen types 0).
   All five return a length-``V`` array summing to 1.
 
 ==========================================================================
-  GOODNESS-OF-FIT: LMSE (Ch.6 Sec 6.5.4)
+  GOODNESS-OF-FIT: LMSE (Ch.6 Sec 6.5.4, Eq. 6.9)
 ==========================================================================
 
-LMSE = Log Mean Squared Error = mean of ``(log p_est - log p_ref)^2`` over
-all vocabulary types. We compare in *log* space because relative frequencies
-span many orders of magnitude. The thesis reports LMSE as *negative* (so
-lower/more-negative = better fit); ``lmse`` returns the negated value to
-match that convention. Identical distributions give LMSE = 0.
+LMSE = Log Mean Squared Error. Following the thesis: compute the mean of
+the squared differences between estimated and ground-truth *raw* relative
+frequencies across all word types observed in the reference corpus (Sec
+6.5.2 defines the target vocabulary as the types observed in the reference
+corpus), then take the base-2 logarithm::
+
+    LMSE = log2( mean( (p_hat - p_ref)^2 ) )
+
+Lower (more negative) values indicate a better fit (Table 6.2: "Lower
+(more negative) values indicate superior performance"); a perfect fit
+gives ``-inf``. Typical values on the thesis's natural-English corpora
+are around -24 to -31. We compare raw frequencies (not log-probabilities)
+because Eq. 6.9 squares the raw residuals; the single log2 compresses the
+scale so "a difference of one unit corresponds to a halving or doubling of
+the underlying mean squared error" (Sec 6.5.4).
 
 ==========================================================================
   HOW TO USE (minimal example)
@@ -102,8 +112,8 @@ match that convention. Identical distributions give LMSE = 0.
     from thesis_aa import data as data_mod
     from thesis_aa.lerf import estimator as lerf_est
 
-    df, _ = data_mod.generate_synthetic()
-    row = lerf_est.evaluate_all_estimators(df, model_name='gpt2')
+    train_df, _ = data_mod.load_natural()
+    row = lerf_est.evaluate_all_estimators(train_df, model_name='gpt2')
     # row has one row, columns: LERF, MLE, Add-One, Good-Turing,
     # Katz-Backoff, Kneser-Ney, Witten-Bell — each an LMSE score.
     print(row.T)
@@ -161,13 +171,75 @@ def count_token_ids(
 # LERF estimation (Ch.6 Sec 6.4.3)
 # ---------------------------------------------------------------------------
 
+def _lerf_windows(seq_len: int, max_len: int, stride: int) -> list[tuple[int, int, int, int]]:
+    """Plan the overlapping scoring windows for one text (pure helper).
+
+    Returns a list of ``(begin, end, first_row, last_row)`` tuples. Each
+    window covers token indices ``[begin, end)``; its logits row ``j``
+    (absolute position ``begin + j``) predicts token ``begin + j + 1``.
+    The caller sums the softmax distributions of rows
+    ``[first_row, last_row]`` (inclusive) of that window.
+
+    Guarantees (Ch.6 Sec 6.4.3 — a text of ``n`` tokens yields ``n-1``
+    contexts, each conditioned on its preceding sequence):
+
+    1. **Exact coverage.** Every predicting position ``0 .. seq_len-2`` is
+       counted in exactly one window — never zero, never twice.
+    2. **Context floor.** A counted position always sees at least
+       ``max_len - stride`` tokens of left context (and at most
+       ``max_len - 1``); positions in the first window see their full true
+       prefix. Exact maximal context for *every* position is impossible
+       with any stride > 1 (adjacent positions would need window starts
+       one token apart), so the overlap size — ``max_len - stride`` — is
+       the context guarantee; the default ``stride = max_len // 2``
+       guarantees half the model context, the standard HuggingFace
+       long-text recipe. Pass a smaller ``stride`` for a higher floor at
+       more compute.
+    3. **No wasted rows.** Non-final windows count through their last row
+       (which predicts the next window's first token with ``max_len - 1``
+       tokens of context); final windows exclude the row whose target
+       would fall outside the text.
+    """
+    if seq_len < 2:
+        return []
+    if seq_len <= max_len:
+        # One window: rows 0..seq_len-2 predict tokens 1..seq_len-1.
+        return [(0, seq_len, 0, seq_len - 2)]
+
+    # Clamp: stride must be <= max_len - 1 so consecutive windows overlap
+    # (a stride equal to max_len would drop ALL context at boundaries).
+    eff_stride = max(1, min(stride, max_len - 1))
+    windows: list[tuple[int, int, int, int]] = []
+    prev_last_counted = -1  # highest absolute position counted so far
+    begin = 0
+    while prev_last_counted < seq_len - 2:
+        end = min(begin + max_len, seq_len)
+        first_row = max(prev_last_counted + 1 - begin, 0)
+        if end < seq_len:
+            # Non-final window: the last row (position end-1) predicts
+            # token `end`, which exists later in the text — count it here
+            # with its full max_len - 1 tokens of context.
+            last_row = (end - begin) - 1
+        else:
+            # Final window: the last row would predict token `seq_len`,
+            # which does not exist — exclude it.
+            last_row = (end - begin) - 2
+        if first_row <= last_row:
+            windows.append((begin, end, first_row, last_row))
+            prev_last_counted = begin + last_row
+        if end == seq_len:
+            break
+        begin += eff_stride
+    return windows
+
+
 def lerf_estimate(
     texts: list[str] | pd.Series,
     model_name: str = "gpt2",
     model=None,
     tokenizer=None,
     device: torch.device | None = None,
-    stride: int = 1024,
+    stride: int | None = None,
 ) -> np.ndarray:
     """Estimate vocabulary-wide relative frequencies via a frozen causal LLM.
 
@@ -182,6 +254,24 @@ def lerf_estimate(
     of context positions). Types that never occur but receive probability from
     the model obtain non-zero estimates (Ch.6 Sec 6.4).
 
+    **Context windowing (Ch.6 Sec 6.4.3):** the manuscript extracts, for a
+    text of ``n`` tokens, ``n-1`` contexts — "the sequence of words that
+    precedes" each token — i.e. every position is conditioned on its
+    preceding sequence. GPT-2's fixed context (``n_positions`` = 1024 for
+    GPT-2) cannot hold a longer document at once, so long texts are scored
+    in overlapping windows (window size = ``n_positions``, advanced by
+    ``stride``; default half the context, the standard HuggingFace
+    long-text recipe). Each predicting position is counted **exactly
+    once**, and a counted position always sees at least
+    ``n_positions - stride`` tokens of left context (up to
+    ``n_positions - 1``); exact maximal context for every position is
+    impossible with any stride > 1, so the overlap size is the context
+    guarantee (see ``_lerf_windows``). Reporting the windowing follows the
+    manuscript's Ch.3 requirement that any sliding-window procedure be
+    reported. With a stride equal to the model context (the previous
+    behaviour), every token after each chunk boundary lost ALL prior
+    context — a context floor of zero — contradicting the Sec 6.4.3 design.
+
     Returns a 1-D array of length ``V`` summing to 1.
     """
     if device is None:
@@ -195,6 +285,13 @@ def lerf_estimate(
     vocab_size = model.config.vocab_size
     acc = torch.zeros(vocab_size, dtype=torch.float64, device=device)
 
+    max_len = model.config.n_positions
+    # Default stride: half the context — the standard HuggingFace long-text
+    # recipe. Every counted position then sees >= n_positions/2 tokens of
+    # left context (up to n_positions - 1). See _lerf_windows for the exact
+    # coverage and context-floor guarantees.
+    eff_stride = (max_len // 2) if stride is None else max(1, min(stride, max_len - 1))
+
     for text in tqdm(texts, desc="LERF"):
         clean = str(text).replace("<BOS>", "").replace("<EOS>", "")
         if not clean.strip():
@@ -205,18 +302,12 @@ def lerf_estimate(
         if seq_len < 2:
             continue
 
-        # Sliding window to handle long texts; the original uses a stride
-        # equal to the model's context. We accumulate the softmax over the
-        # *predicted* token at each position (logits at position i predict i+1).
-        max_len = model.config.n_positions
-        for begin in range(0, seq_len - 1, stride):
-            end = min(begin + max_len, seq_len)
+        for begin, end, first_row, last_row in _lerf_windows(seq_len, max_len, eff_stride):
             chunk = ids[begin:end].unsqueeze(0).to(device)
             with torch.no_grad():
                 logits = model(chunk).logits  # (1, L, V)
                 probs = F.softmax(logits, dim=-1)  # (1, L, V)
-            # Position i predicts token i+1. Sum over positions 0..L-2.
-            acc += probs[0, :-1, :].sum(dim=0).double()
+            acc += probs[0, first_row:last_row + 1, :].sum(dim=0).double()
 
     total = acc.sum()
     if total.item() == 0:
@@ -333,7 +424,7 @@ def _good_turing(counts: np.ndarray, vocab_size: int) -> np.ndarray:
 
 
 def _katz_backoff(counts: np.ndarray, vocab_size: int) -> np.ndarray:
-    """Katz backoff approximation using Good-Turing discounting (Ch.6 Sec 6.3.1).
+    """Katz backoff approximation using Good-Turing discounting (Ch.6 Sec 6.3.1, Eq. 6.4).
 
     **Intuition:** Take a little probability mass away from every *seen* type
     (proportional to a Good-Turing discount factor) and distribute the
@@ -347,6 +438,16 @@ def _katz_backoff(counts: np.ndarray, vocab_size: int) -> np.ndarray:
     ``r* / r = (r+1) * N_{r+1} / (r * N_r)``, computed from the
     frequency-of-frequencies. Counts for which the factor cannot be
     estimated (``N_r`` or ``N_{r+1}`` zero) keep factor 1.0 (no discounting).
+
+    **Normalisation (Eq. 6.4's ``lambda``):** the manuscript defines a
+    "normalization factor that distributes the freed probability over the
+    backed-off distribution". Two practical guards follow from this:
+
+    * When the frequency-of-frequencies curve is non-monotone (``N_{r+1}/N_r``
+      implies a discount factor > 1), the raw computation would *add* mass;
+      the freed mass is clamped at >= 0 (a discount never increases mass).
+    * The final distribution is renormalised to sum to exactly 1, matching
+      Eq. 6.4's normalisation and the other estimators' contract.
     """
     N = counts.sum()
     if N == 0:
@@ -360,17 +461,27 @@ def _katz_backoff(counts: np.ndarray, vocab_size: int) -> np.ndarray:
         if Nr > 0 and Nr1 > 0:
             gt_factor[r] = ((r + 1) * Nr1) / (r * Nr)
 
+    # A discount factor > 1 would inflate rather than discount; clamp so
+    # freed mass is never negative (Eq. 6.4 discounts only).
+    gt_factor_clamped = np.minimum(gt_factor, 1.0)
+
     discounted = np.zeros_like(counts, dtype=float)
     for r in range(1, len(freq_of_freq)):
         if freq_of_freq[r] > 0:
-            discounted[counts == r] = counts[counts == r] * gt_factor[r]
+            discounted[counts == r] = counts[counts == r] * gt_factor_clamped[r]
 
-    freed_mass = (counts * (1 - np.where(counts > 0, gt_factor[counts.astype(int)], 1.0))).sum()
+    freed_mass = (counts * (1 - np.where(counts > 0, gt_factor_clamped[counts.astype(int)], 1.0))).sum()
+    freed_mass = max(freed_mass, 0.0)
     n_unseen = (counts == 0).sum()
 
-    p = discounted / N if N > 0 else discounted
-    if n_unseen > 0 and freed_mass > 0:
-        p[counts == 0] = freed_mass / n_unseen / N
+    p = np.zeros_like(counts, dtype=float)
+    if N > 0:
+        p += discounted / N
+        if n_unseen > 0 and freed_mass > 0:
+            p[counts == 0] = freed_mass / n_unseen / N
+    total = p.sum()
+    if total > 0:
+        p = p / total  # Eq. 6.4 normalisation: the estimate sums to 1
     return p
 
 
@@ -420,46 +531,90 @@ def _witten_bell(counts: np.ndarray, vocab_size: int) -> np.ndarray:
 # Goodness-of-fit metric: LMSE (Ch.6 Sec 6.5.4)
 # ---------------------------------------------------------------------------
 
-def lmse(estimated: np.ndarray, reference: np.ndarray, eps: float = 1e-12) -> float:
-    """Log Mean Squared Error between estimated and reference distributions.
+def lmse(estimated: np.ndarray, reference: np.ndarray) -> float:
+    """Log Mean Squared Error between estimated and reference distributions
+    (Ch.6 Sec 6.5.4, Eq. 6.9).
 
-    LMSE = mean( (log p_est - log p_ref)^2 ), summed in log space. Following
-    the thesis (Ch.6 Table), lower (more negative) values indicate better fit,
-    so we return the negative mean squared log-error for consistency with the
-    reported tables.
+    Following the thesis exactly: take the mean of the squared differences
+    between estimated and ground-truth **raw relative frequencies** across
+    all word types over which the estimator is evaluated, then take the
+    base-2 logarithm of the result::
+
+        LMSE = log2( mean_over_T( (p_hat_w - p_ref_w)^2 ) )
+
+    where ``T`` is the set of types observed in the reference corpus
+    (Ch.6 Sec 6.5.2 defines the target vocabulary this way — the reference
+    corpus always contains the evaluation corpus, so every evaluation type
+    is included). Lower (more negative) values indicate a better fit, per
+    Table 6.2 ("Lower (more negative) values indicate superior
+    performance"); a perfect fit gives ``-inf`` (log2 of 0). No eps floor
+    and no log-of-probabilities are used — Eq. 6.9 squares the raw
+    frequency residuals, and the log is applied once, to the mean.
+
+    Example::
+
+        # thesis-scale values: identical distributions -> -inf;
+        # realistic fits on natural-English corpora land around -24..-31
+        # (Table 6.2).
     """
     est = np.asarray(estimated, dtype=np.float64)
     ref = np.asarray(reference, dtype=np.float64)
-    mask = (est > 0) | (ref > 0)
-    log_est = np.log(est[mask] + eps)
-    log_ref = np.log(ref[mask] + eps)
-    mse = np.mean((log_est - log_ref) ** 2)
-    return -float(mse)  # more negative = better (per thesis tables)
+    if est.shape != ref.shape:
+        raise ValueError(
+            f"Shape mismatch: estimated {est.shape} vs reference {ref.shape}"
+        )
+    # Evaluate over the types observed in the reference corpus (Sec 6.5.2:
+    # "the target vocabulary is defined by the set of word types observed in
+    # the reference corpus").
+    mask = ref > 0
+    if not mask.any():
+        return float("-inf")
+    diffs = est[mask] - ref[mask]
+    mse = float(np.mean(diffs ** 2))
+    if mse == 0.0:
+        return float("-inf")
+    return float(np.log2(mse))
 
 
 # ---------------------------------------------------------------------------
 # Corpus splitting (Ch.6 Sec 6.5.2)
 # ---------------------------------------------------------------------------
 
-def split_corpus(df: pd.DataFrame, eval_frac: float = 0.2, seed: int = 0,
+def split_corpus(df: pd.DataFrame, eval_frac: float = 0.5, seed: int = 0,
                  text_col: str = "text", tag_col: str = "author_tag") -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Split a corpus into a small evaluation (sample) set and a reference set.
+    """Split a corpus into an evaluation (sample) subset and its reference set.
 
-    The evaluation set acts as the sample corpus; the reference set represents
-    the full population whose distribution we wish to estimate (Ch.6 Sec
-    6.5.2). The intuition is a lab experiment: you get to *see* only a small
-    sample (the eval set) and must estimate the word-frequency table of the
-    whole variety; the reference set is the "answer key" you score against.
+    Follows the manuscript's evaluation design (Ch.6 Sec 6.5.2) exactly: the
+    *reference* corpus is the full input corpus (treated as the population
+    whose word probabilities we want to estimate), and the *evaluation*
+    corpus is a smaller sample of texts "drawn at random from that
+    reference corpus" — so, as the manuscript specifies, "the reference
+    corpus always contains the evaluation corpus as well as additional
+    texts". The intuition is a lab experiment: you get to *see* only the
+    small sample (the eval set) and must estimate the word-frequency table
+    of the whole variety; the reference set is the "answer key" you score
+    against.
 
-    The shuffle is a plain row-level cut (NOT per-author stratified) because
+    The default ``eval_frac=0.5`` follows the manuscript (Sec 6.5.2): "We
+    have therefore chosen to draw an evaluation corpus that consists of 50%
+    of the word tokens found in each reference corpus." The draw is by whole
+    texts, which approximates the 50% token share.
+
+    The sample is a plain row-level draw (NOT per-author stratified) because
     the LERF question is about the corpus as one variety of language, not
     about per-author balance.
 
-    Returns ``(eval_df, reference_df)``.
+    Returns ``(eval_df, reference_df)`` where ``reference_df`` is the full
+    input corpus (index-reset) and ``eval_df`` is a random subset of it.
     """
-    shuffled = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    cut = int(len(shuffled) * eval_frac)
-    return shuffled.iloc[:cut], shuffled.iloc[cut:]
+    if not 0 < eval_frac <= 1:
+        raise ValueError(
+            f"eval_frac must be in (0, 1] (a fraction of texts drawn from "
+            f"the reference corpus); got {eval_frac}"
+        )
+    reference_df = df.reset_index(drop=True)
+    eval_df = df.sample(frac=eval_frac, random_state=seed).reset_index(drop=True)
+    return eval_df, reference_df
 
 
 # ---------------------------------------------------------------------------
@@ -469,15 +624,22 @@ def split_corpus(df: pd.DataFrame, eval_frac: float = 0.2, seed: int = 0,
 def evaluate_all_estimators(
     df: pd.DataFrame,
     model_name: str = "gpt2",
-    eval_frac: float = 0.2,
+    eval_frac: float = 0.5,
     seed: int = 0,
     device: torch.device | None = None,
     text_col: str = "text",
 ) -> pd.DataFrame:
     """Evaluate LERF + all standard estimators on one corpus split.
 
-    Returns a one-row DataFrame with LMSE scores for every estimator, keyed
-    by estimator name (matching the Ch.6 result tables).
+    Follows the manuscript's evaluation design (Ch.6 Sec 6.5): the input
+    corpus is the reference corpus (the "population"); a random subset of
+    ``eval_frac`` of its texts (default 50%, per Sec 6.5.2) forms the
+    evaluation (sample) corpus. Each estimator sees *only* the sample and
+    is scored (LMSE, Eq. 6.9 — lower is better) against the reference
+    distribution.
+
+    Returns a one-row DataFrame with LMSE scores for every estimator,
+    keyed by estimator name (matching the Ch.6 result tables).
     """
     eval_df, ref_df = split_corpus(df, eval_frac=eval_frac, seed=seed, text_col=text_col)
     eval_texts = eval_df[text_col].tolist()
